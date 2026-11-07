@@ -45,6 +45,15 @@
   color-scheme:dark;
 }
 *{box-sizing:border-box}
+body.out .tabs, body.out .month, body.out .top [data-act="addTxn"]{display:none}
+.login{max-width:400px;margin:6vh auto 0;display:flex;flex-direction:column;gap:14px}
+.login .head{display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center}
+.login .brand-mark{width:60px;height:60px;border-radius:16px;font-size:1.9rem}
+.login h1{font-family:var(--f-display);font-size:1.9rem}
+.login p{color:var(--ink-2);margin:0}
+.login form{display:flex;flex-direction:column;gap:12px}
+.login .btn{justify-content:center;padding:10px 16px;font-size:.95rem}
+.login .err{color:var(--crit);font-size:.88rem;min-height:1.2em}
 :root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 [hidden]{display:none!important}
 img{max-width:100%}
@@ -250,6 +259,9 @@ tr.uncat td.cat select{border-color:var(--warn)}
 <input type="file" id="fileImport" accept=".xlsx,.xls,.csv,.pdf,application/pdf" hidden>
 <input type="file" id="fileBackup" accept=".json" hidden>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script>
@@ -436,17 +448,53 @@ function localDb() {
   window.addEventListener('storage', e => { if (e.key === STORE_KEY) { try { data = JSON.parse(e.newValue || '{}'); } catch {} subs.forEach(f => f()); } });
   return {doc: docRef, collection: c => query(c)};
 }
-let loadTimer = null;
+/* ---------- Firebase (cloud sync). Empty apiKey = data stays on this device only ---------- */
+const FIREBASE_CONFIG = {
+  apiKey: "",
+  authDomain: "",
+  projectId: "",
+  storageBucket: "",
+  messagingSenderId: "",
+  appId: ""
+};
+const CLOUD = !!FIREBASE_CONFIG.apiKey;
+let loadTimer = null, AUTH = null, FS = null;
+const unsubs = [];
 async function boot() {
   route();
-  S.db = localDb();
   try { navigator.storage?.persist?.(); } catch {}
-  const db = S.db, onErr = e => { S.err = e?.code || 'unavailable'; render(); };
-  db.doc('settings/main').onSnapshot(s => { S.settings = s.exists ? s.data() : null; arrive('settings', s); }, onErr);
-  const col = (name, key, map) => db.collection(name).onSnapshot(q => {
+  if (!CLOUD) { S.mode = 'local'; startData(localDb()); return; }
+  S.mode = 'cloud';
+  if (!window.firebase) { S.cloudFail = true; render(); return; }
+  firebase.initializeApp(FIREBASE_CONFIG);
+  AUTH = firebase.auth(); FS = firebase.firestore();
+  try { FS.settings({ignoreUndefinedProperties: true, cacheSizeBytes: firebase.firestore.CACHE_SIZE_UNLIMITED}); } catch {}
+  try { await FS.enablePersistence({synchronizeTabs: true}); } catch {}
+  AUTH.onAuthStateChanged(u => {
+    S.authChecked = true;
+    if (u && u.emailVerified) { if (S.authUser?.uid !== u.uid || !S.db) startCloud(u); }
+    else { stopData(); S.authUser = u ? {uid: u.uid, email: u.email, unverified: true} : null; render(); }
+  });
+  render();
+}
+function stopData() {
+  unsubs.splice(0).forEach(f => f()); unsubTx?.(); unsubTx = null; clearTimeout(loadTimer);
+  Object.assign(S, {db: null, settings: null, budget: [], accounts: [], snapshots: [], rules: [], incomes: {}, txns: [], loaded: new Set(), fresh: new Set(), txLoaded: false, err: null, stale: false, imp: null, restore: null});
+}
+function startCloud(u) {
+  stopData();
+  S.authUser = {uid: u.uid, email: u.email};
+  const base = `users/${u.uid}/`;
+  startData({doc: p => FS.doc(base + p), collection: p => FS.collection(base + p)});
+}
+function startData(db) {
+  S.db = db;
+  const onErr = e => { S.err = e?.code || 'unavailable'; render(); };
+  unsubs.push(db.doc('settings/main').onSnapshot(s => { S.settings = s.exists ? s.data() : null; arrive('settings', s); }, onErr));
+  const col = (name, key, map) => unsubs.push(db.collection(name).onSnapshot(q => {
     const rows = q.docs.map(d => ({id: d.id, ...d.data()}));
     S[key] = map ? map(rows) : rows; arrive(name, q);
-  }, onErr);
+  }, onErr));
   col('budget', 'budget', r => r.sort((a, b) => (a.order ?? 0) - (b.order ?? 0)));
   col('accounts', 'accounts', r => r.sort((a, b) => (a.order ?? 0) - (b.order ?? 0)));
   col('snapshots', 'snapshots', r => r.sort((a, b) => a.id.localeCompare(b.id)));
@@ -456,6 +504,16 @@ async function boot() {
   render();
 }
 function arrive(name) { S.loaded.add(name); S.fresh.add(name); scheduleRender(); }
+/* Offline, a cloud write is saved on the device at once and sent when the connection returns,
+   so the screen never waits for the server: after 1.5 s we treat the write as done. */
+function commit(p) {
+  if (S.mode !== 'cloud' || !p || typeof p.then !== 'function') return p;
+  let done = false;
+  return Promise.race([
+    p.then(v => { done = true; return v; }, e => { if (done) { writeErr(e); return; } done = true; throw e; }),
+    sleep(1500).then(() => { done = true; }),
+  ]);
+}
 let unsubTx = null;
 function subTxns() {
   if (!S.db) return;
@@ -467,9 +525,9 @@ function subTxns() {
 }
 async function withRetry(fn) {
   for (let i = 0; ; i++) {
-    try { return await fn(); }
+    try { return await commit(fn()); }
     catch (e) {
-      if (i < 3 && (e?.code === 'resource_exhausted' || e?.code === 'unavailable')) { await sleep(600 * 2 ** i + Math.random() * 300); continue; }
+      if (i < 3 && ['resource_exhausted', 'resource-exhausted', 'unavailable'].includes(e?.code)) { await sleep(600 * 2 ** i + Math.random() * 300); continue; }
       throw e;
     }
   }
@@ -477,7 +535,8 @@ async function withRetry(fn) {
 function writeErr(e) {
   const c = e?.code;
   if (c === 'quota_exceeded') toast('המאגר מלא. מחק תנועות ישנות או גבה ונקה.');
-  else if (c === 'invalid_argument') toast('אין לך הרשאה לשמור כאן, או שהנתון לא תקין.');
+  else if (c === 'invalid_argument' || c === 'invalid-argument') toast('הנתון לא תקין ולא נשמר.');
+  else if (c === 'permission-denied') toast('אין הרשאה לשמור. בדוק את כללי האבטחה ב-Firebase.');
   else toast('השמירה נכשלה. נסה שוב בעוד רגע.');
   console.error(e);
 }
@@ -500,17 +559,59 @@ function render() {
   charts.forEach(c => c.destroy()); charts = [];
   $('#monthLabel').textContent = monthLabel(S.month);
   document.querySelectorAll('#tabs a').forEach(a => { if (a.dataset.v === S.view) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
+  const gate = S.mode === 'cloud' && !!(S.cloudFail || !S.authChecked || !S.authUser || S.authUser.unverified);
+  document.body.classList.toggle('out', gate);
+  if (gate) { $('#view').innerHTML = authHtml(); return; }
   const v = VIEWS[S.view];
   $('#view').innerHTML = banners() + v.html();
   v.after?.();
 }
+function authHtml() {
+  const head = `<div class="head"><span class="brand-mark" aria-hidden="true">₪</span><h1>פנקס הכסף</h1></div>`;
+  if (S.cloudFail) return `<section class="login">${head}<p>רכיב הסנכרון לא נטען. בדוק את החיבור לאינטרנט ופתח שוב את האפליקציה.</p></section>`;
+  if (!S.authChecked) return `<section class="login">${head}<p style="text-align:center">טוען…</p></section>`;
+  if (S.authUser?.unverified) return `<section class="login">${head}
+    <p>שלחנו מייל אימות ל-<b>${esc(S.authUser.email)}</b>. פתח אותו ולחץ על הקישור, ואז חזור לכאן.</p>
+    <button class="btn primary" data-act="checkVerified">אימתתי, להמשיך</button>
+    <button class="btn" data-act="resendVerify">שליחת המייל שוב</button>
+    <button class="btn ghost" data-act="signOut">התחברות עם חשבון אחר</button>
+    <div class="err" id="authErr"></div></section>`;
+  const signup = S.authMode === 'signup';
+  return `<section class="login">${head}
+    <p style="text-align:center">${signup ? 'יצירת חשבון. הנתונים יישמרו בענן ויסונכרנו בין הטלפון למחשב.' : 'כניסה לפנקס. הנתונים מסונכרנים בין כל המכשירים שלך.'}</p>
+    <form data-form="auth">
+      <div class="field"><label for="authEmail">מייל</label><input id="authEmail" name="email" type="email" autocomplete="username" dir="ltr" required value="${esc(S.authEmail || '')}"></div>
+      <div class="field"><label for="authPass">סיסמה</label><input id="authPass" name="pw" type="password" autocomplete="${signup ? 'new-password' : 'current-password'}" dir="ltr" required minlength="6">
+        ${signup ? '<span class="hint">לפחות 6 תווים</span>' : ''}</div>
+      <button class="btn primary">${signup ? 'יצירת חשבון' : 'כניסה'}</button>
+      <div class="err" id="authErr"></div>
+    </form>
+    <button class="btn ghost" data-act="authToggle">${signup ? 'כבר יש לי חשבון: כניסה' : 'פעם ראשונה? יצירת חשבון'}</button>
+    ${signup ? '' : '<button class="btn ghost" data-act="resetPass">שכחתי סיסמה</button>'}
+  </section>`;
+}
+const AUTH_ERR = {
+  'auth/invalid-credential': 'מייל או סיסמה לא נכונים.', 'auth/wrong-password': 'מייל או סיסמה לא נכונים.', 'auth/user-not-found': 'לא נמצא חשבון עם המייל הזה. אפשר ליצור חשבון.',
+  'auth/email-already-in-use': 'כבר יש חשבון עם המייל הזה. נסה להיכנס.', 'auth/weak-password': 'הסיסמה קצרה מדי (לפחות 6 תווים).', 'auth/invalid-email': 'כתובת המייל לא תקינה.',
+  'auth/network-request-failed': 'אין חיבור לאינטרנט. בפעם הראשונה צריך חיבור כדי להיכנס.', 'auth/too-many-requests': 'יותר מדי ניסיונות. חכה כמה דקות ונסה שוב.',
+  'auth/operation-not-allowed': 'כניסה עם מייל וסיסמה לא הופעלה ב-Firebase (Authentication ← Email/Password).',
+};
+const authErr = (e) => { const el = $('#authErr'); if (el) el.textContent = AUTH_ERR[e?.code] || ('משהו השתבש (' + (e?.code || e?.message || 'שגיאה') + ')'); };
+async function localHasData() {
+  try { const d = JSON.parse(localStorage.getItem('pinkas-db-v1') || '{}'); return Object.keys(d).length; } catch { return 0; }
+}
 function lastBackup() { try { return Number(localStorage.getItem('pinkas-last-backup')) || 0; } catch { return 0; } }
 function banners() {
-  if (BASE.every(n => S.loaded.has(n)) && !S.settings && !S.budget.length && !S.accounts.length)
+  const empty = BASE.every(n => S.loaded.has(n)) && !S.settings && !S.budget.length && !S.accounts.length;
+  let localCount = 0; try { localCount = S.mode === 'cloud' && !localStorage.getItem('pinkas-migrated') ? Object.keys(JSON.parse(localStorage.getItem('pinkas-db-v1') || '{}')).length : 0; } catch {}
+  if (S.mode === 'cloud' && localCount)
+    return `<div class="banner info" style="flex-wrap:wrap">ⓘ בטלפון הזה שמורים ${localCount} פריטים מלפני החיבור לענן.${empty ? '' : ' רשומות עם אותו מזהה יוחלפו.'}
+      <span class="actions" style="margin-inline-start:auto"><button class="btn sm primary" data-act="migrateLocal">העברה לענן</button><button class="btn sm" data-act="skipMigrate">לא עכשיו</button></span></div>`;
+  if (empty)
     return `<div class="banner info" style="flex-wrap:wrap">ⓘ ברוך הבא! כדי להעביר את הנתונים מהגרסה ב-claude.ai: שם, בהגדרות, לוחצים "גיבוי מלא (JSON)", ואז כאן בוחרים את הקובץ.
       <button class="btn sm primary" data-act="pickBackup" style="margin-inline-start:auto">שחזור מגיבוי</button></div>`;
   const lb = lastBackup(), days = lb ? Math.floor((Date.now() - lb) / 864e5) : null;
-  if (S.view === 'overview' && (S.budget.length || S.txns.length) && (days === null || days >= 30))
+  if (S.mode !== 'cloud' && S.view === 'overview' && (S.budget.length || S.txns.length) && (days === null || days >= 30))
     return `<div class="banner" style="flex-wrap:wrap">⚠ הנתונים שמורים רק בטלפון הזה. ${days === null ? 'עוד לא עשית גיבוי.' : `הגיבוי האחרון לפני ${days} ימים.`}
       <button class="btn sm" data-act="exportJson" style="margin-inline-start:auto">גיבוי עכשיו</button></div>`;
   if (S.err) return `<div class="banner">⚠ החיבור לנתונים נקטע (${esc(S.err)}). רענן את הדף כדי להתחבר מחדש.</div>`;
@@ -1133,6 +1234,9 @@ VIEWS.prefs = {html() {
     ${S.rules.length ? `<div class="tw"><table><thead><tr><th>בית עסק</th><th>קטגוריה</th><th class="n">החלק שלי</th><th></th></tr></thead><tbody>${ruleRows}</tbody></table></div>`
       : emptyBox('אין עדיין חוקים', 'כשתסווג עסקאות בייבוא פירוט אשראי, הסיווג יישמר כאן ויוחל אוטומטית בפעם הבאה.')}
   </section>
+  ${S.mode === 'cloud' ? `<section class="sec"><div class="sec-h"><h3>חשבון</h3></div>
+    <div class="panel inline" style="justify-content:space-between"><span>מחובר כ-<b dir="ltr">${esc(S.authUser?.email)}</b> · הנתונים מסונכרנים בענן</span><button class="btn" data-act="signOut">יציאה</button></div>
+  </section>` : ''}
   <section class="sec"><div class="sec-h"><h3>גיבוי וייצוא</h3></div>
     <div class="panel" style="display:flex;flex-direction:column;gap:12px">
       <div class="actions">
@@ -1142,7 +1246,8 @@ VIEWS.prefs = {html() {
       </div>
       ${S.restore ? `<div class="banner" style="flex-wrap:wrap">⚠ בגיבוי ${S.restore.count} רשומות. רשומות עם אותו מזהה יוחלפו, ושאר הרשומות יישארו.
         <span class="actions" style="margin-inline-start:auto"><button class="btn sm primary" data-act="doRestore" ${S.restore.busy ? 'disabled' : ''}>${S.restore.busy ? 'משחזר…' : 'שחזר עכשיו'}</button><button class="btn sm" data-act="cancelRestore">ביטול</button></span></div>` : ''}
-      <span class="muted" style="font-size:.82rem">הנתונים שמורים רק בטלפון הזה. כדאי לגבות פעם בחודש ולשמור את הקובץ בגוגל דרייב, iCloud או במייל. הגיבוי כולל את כל התנועות, התקציב, הנכסים, ההיסטוריה וההגדרות.${lastBackup() ? ` גיבוי אחרון: ${new Date(lastBackup()).toLocaleDateString('he-IL')}.` : ''}</span>
+      <span class="muted" style="font-size:.82rem">${S.mode === 'cloud' ? 'הנתונים נשמרים אוטומטית בענן (Firebase) ומסונכרנים בין המכשירים, כך שאין צורך בגיבוי ידני. אפשר להוריד עותק לשמירה בצד.' : ''}</span>
+      <span class="muted" style="font-size:.82rem" ${S.mode === 'cloud' ? 'hidden' : ''}>הנתונים שמורים רק בטלפון הזה. כדאי לגבות פעם בחודש ולשמור את הקובץ בגוגל דרייב, iCloud או במייל. הגיבוי כולל את כל התנועות, התקציב, הנכסים, ההיסטוריה וההגדרות.${lastBackup() ? ` גיבוי אחרון: ${new Date(lastBackup()).toLocaleDateString('he-IL')}.` : ''}</span>
     </div>
   </section>`;
 }};
@@ -1266,6 +1371,30 @@ function balancesForm() {
 
 /* ---------- actions ---------- */
 const ACT = {
+  authToggle: () => { S.authEmail = $('#authEmail')?.value || S.authEmail; S.authMode = S.authMode === 'signup' ? 'signin' : 'signup'; render(); },
+  resetPass: async () => {
+    const email = $('#authEmail')?.value.trim();
+    if (!email) { authErr({message: 'כתוב קודם את המייל'}); $('#authErr').textContent = 'כתוב קודם את המייל ואז לחץ שוב.'; return; }
+    try { await AUTH.sendPasswordResetEmail(email); toast('שלחנו מייל לאיפוס הסיסמה'); } catch (e) { authErr(e); }
+  },
+  checkVerified: async el => {
+    el.disabled = true;
+    try { const u = AUTH.currentUser; await u.reload(); await u.getIdToken(true); if (AUTH.currentUser.emailVerified) { startCloud(AUTH.currentUser); return; } $('#authErr').textContent = 'עוד לא אומת. לחץ על הקישור במייל (בדוק גם בספאם) ונסה שוב.'; }
+    catch (e) { authErr(e); }
+    el.disabled = false;
+  },
+  resendVerify: async () => { try { await AUTH.currentUser.sendEmailVerification(); toast('המייל נשלח שוב'); } catch (e) { authErr(e); } },
+  signOut: () => { stopData(); S.authMode = 'signin'; AUTH?.signOut(); },
+  skipMigrate: () => { try { localStorage.setItem('pinkas-migrated', 'skipped'); } catch {} render(); },
+  migrateLocal: async el => {
+    el.disabled = true; el.textContent = 'מעביר…';
+    let d = {}; try { d = JSON.parse(localStorage.getItem('pinkas-db-v1') || '{}'); } catch {}
+    const entries = Object.entries(d); let fail = 0;
+    for (let i = 0; i < entries.length; i += 8) await Promise.all(entries.slice(i, i + 8).map(async ([p, v]) => { try { await withRetry(() => S.db.doc(p).set(v)); } catch { fail++; } }));
+    if (!fail) { try { localStorage.setItem('pinkas-migrated', String(Date.now())); } catch {} }
+    toast(fail ? `הועברו ${entries.length - fail} פריטים, ${fail} נכשלו. נסה שוב.` : `הועברו ${entries.length} פריטים לענן`);
+    render();
+  },
   month: el => { S.month = addMonth(S.month, Number(el.dataset.d)); subTxns(); if (S.imp?.step === 'preview') markDups().then(render); render(); },
   addTxn: () => txnForm(null),
   editTxn: el => { const t = S.txns.find(x => x.id === el.dataset.id); if (t) txnForm(t); },
@@ -1316,6 +1445,16 @@ document.addEventListener('submit', async e => {
     const btn = e.target.querySelector('[type=submit]'); btn.disabled = true;
     const ok = await formState.onSave(readForm());
     if (ok !== false) closeModal(); else btn.disabled = false;
+    return;
+  }
+  if (e.target.dataset.form === 'auth') {
+    const email = e.target.email.value.trim(), pw = e.target.pw.value, btn = e.target.querySelector('button');
+    S.authEmail = email; btn.disabled = true; $('#authErr').textContent = '';
+    try {
+      if (S.authMode === 'signup') { const cred = await AUTH.createUserWithEmailAndPassword(email, pw); await cred.user.sendEmailVerification(); }
+      else await AUTH.signInWithEmailAndPassword(email, pw);
+      S.authMode = 'signin';
+    } catch (err) { authErr(err); btn.disabled = false; }
     return;
   }
   if (e.target.dataset.form === 'pdfPass' && S.imp?.step === 'pdfpass') {
